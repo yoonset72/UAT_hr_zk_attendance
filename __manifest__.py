@@ -41,7 +41,6 @@
         'views/daily_attendance_views.xml',
         'views/biometric_device_attendance_menus.xml',
         'views/biometric_device_action.xml',
-        'data/download_data.xml',
         'data/biometric_device_cron.xml',
     ],
     'images': ['static/description/banner.png'],

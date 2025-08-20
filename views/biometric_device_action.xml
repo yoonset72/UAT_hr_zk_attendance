@@ -1,6 +1,6 @@
 <odoo>
-    <record id="biometric_device_menu_action" model="ir.actions.act_window">
-        <field name="name">Biometric Device</field>
+    <record id="action_biometric_device" model="ir.actions.act_window">
+        <field name="name">Biometric Devices</field>
         <field name="res_model">biometric.device.details</field>
         <field name="view_mode">tree,form</field>
     </record>

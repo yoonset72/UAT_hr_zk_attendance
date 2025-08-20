@@ -377,7 +377,7 @@ class BiometricDeviceDetails(models.Model):
         }
 
 
-
+   
     def action_restart_device(self):
         zk = self._get_connection_object()
         conn = self.device_connect(zk)
