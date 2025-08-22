@@ -19,7 +19,7 @@
 #    If not, see <http://www.gnu.org/licenses/>.
 #
 ################################################################################
-from . import biometric_device
+from . import biometric
 from . import zk_machine_attendance
 from . import daily_attendance
 from . import hr_employee

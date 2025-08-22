@@ -114,7 +114,7 @@ class BiometricDeviceDetails(models.Model):
             return 'night', [(datetime.time(16, 45), datetime.time(8, 45))]
         # detect night or day shift from slot ordering
         slots = [(self._float_hour_to_time(s.hour_from), self._float_hour_to_time(s.hour_to)) for s in working_hours]
-        if slots[0][1] < slots[0][0]:
+        if slots[0][0] == datetime.time(0, 0):
             return 'night', slots
         else:
             return 'day', slots
@@ -207,24 +207,64 @@ class BiometricDeviceDetails(models.Model):
                                                                      'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))}).id
                                     record_created = True
 
-                        else:  # night shift
-                            first_start, first_end = slots[0]
-                            if punch.time() <= first_end:
-                                record_id = hr_attendance.create({'employee_id': emp_id,
-                                                                 'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))}).id
+                        else:
+                                                       
+                            shift_start = slots[1][0]
+                            shift_end = slots[0][1]
+                            shift_check = slots[1][1]
+                            
+                            punch_date = punch.date()
+                            shift_start_dt = datetime.datetime.combine(punch, shift_start)
+                            shift_check_dt = datetime.datetime.combine(punch, shift_check)
+                            prev_day = punch.date() - datetime.timedelta(days=1)
+
+                            # Localize to device timezone
+                            shift_start_dt = device_tz.localize(shift_start_dt)
+                            shift_check_dt = device_tz.localize(shift_check_dt)
+
+                            _logger.info(
+                                "Employee %s | Punch: %s | Shift check: %s | Prev day: %s",
+                                emp_id,
+                                punch.strftime("%Y-%m-%d %H:%M:%S"),
+                                shift_check_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                                prev_day.strftime("%Y-%m-%d")
+                            )
+
+                            # Determine check-in / check-out
+                            if (shift_start_dt - datetime.timedelta(hours=2)) <= punch < shift_check_dt:
+                                # Valid check-in
+                                record_id = hr_attendance.create({
+                                    'employee_id': emp_id,
+                                    'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
+                                }).id
                                 record_created = True
                             else:
-                                prev_att = hr_attendance.search([('employee_id', '=', emp_id),
-                                                                 ('check_out', '=', False)],
-                                                                order="check_in desc", limit=1)
+                                # Check previous open attendance
+                                prev_day = punch.date() - datetime.timedelta(days=1)
+                                prev_att = hr_attendance.search([
+                                    ('employee_id', '=', emp_id),
+                                    ('check_out', '=', False),
+                                    ('check_in', '>=', fields.Datetime.to_string(
+                                        datetime.datetime.combine(prev_day, datetime.time.min).astimezone(pytz.utc)
+                                    )),
+                                    ('check_in', '<', fields.Datetime.to_string(
+                                        datetime.datetime.combine(punch_date, datetime.time.min).astimezone(pytz.utc)
+                                    )),
+                                ], order="check_in desc", limit=1)
+
                                 if prev_att:
-                                    prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    prev_att.write({
+                                        'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                    })
                                 else:
-                                    # create open attendance with blank check-in
-                                    record_id = hr_attendance.create({'employee_id': emp_id,
-                                                                     'check_in': False,
-                                                                     'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))}).id
+                                    # Orphan punch → create record with blank check-in
+                                    record_id = hr_attendance.create({
+                                        'employee_id': emp_id,
+                                        'check_in': False,
+                                        'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
+                                    }).id
                                     record_created = True
+
 
             finally:
                 try:
@@ -259,3 +299,151 @@ class BiometricDeviceDetails(models.Model):
                 conn.disconnect()
         else:
             raise UserError(_("Unable to connect to device for restart."))
+
+
+    #-------------------Cron Download-----------------#
+
+    def cron_download(self):
+        """
+        Cron job to download today's attendance every 3 hours.
+        Logic is same as action_download_attendance but only for today.
+        """
+        start_time = time.time()
+        _logger.info("Cron: Downloading today's attendance...")
+
+        zk_attendance = self.env['zk.machine.attendance']
+        hr_attendance = self.env['hr.attendance']
+
+        today = fields.Date.today()
+        start_date = today
+        end_date = today
+        device_tz = pytz.timezone('Asia/Rangoon')
+
+        for info in self:
+            zk = self._get_connection_object()
+            conn = self.device_connect(zk)
+            if not conn:
+                _logger.error("Cron: Unable to connect to device %s", info.name)
+                continue
+
+            try:
+                conn.disable_device()
+                all_attendance = conn.get_attendance()
+                grouped_punches = {}
+
+                for att in all_attendance:
+                    raw_ts = att.timestamp
+                    local_dt = device_tz.localize(raw_ts) if raw_ts.tzinfo is None else raw_ts.astimezone(device_tz)
+                    att_date = local_dt.date()
+                    if not (start_date <= att_date <= end_date):
+                        continue
+                    employee = self.env['hr.employee'].search([('employee_number', '=', att.user_id)], limit=1)
+                    if not employee:
+                        continue
+                    utc_dt = local_dt.astimezone(pytz.utc)
+                    punching_time = fields.Datetime.to_string(utc_dt)
+                    if not zk_attendance.search([('device_id_num', '=', att.user_id), ('punching_time', '=', punching_time)], limit=1):
+                        zk_attendance.create({'employee_id': employee.id, 'device_id_num': att.user_id,
+                                            'attendance_type': str(getattr(att, 'status', '1')),
+                                            'punch_type': str(getattr(att, 'punch', '0')),
+                                            'punching_time': punching_time,
+                                            'address_id': info.address_id.id})
+                    grouped_punches.setdefault(employee.id, []).append(local_dt)
+
+                # Process punches (same as button logic)
+                for emp_id, punches in grouped_punches.items():
+                    punches = sorted(punches)
+                    employee = self.env['hr.employee'].browse(emp_id)
+                    for punch in punches:
+                        if punch.tzinfo is None:
+                            punch = device_tz.localize(punch)
+                        shift_type, slots = self._select_shift_type(employee, punch)
+                        record_created = False
+
+                        if shift_type == 'day':
+                            first_start, first_end = slots[0]
+                            second_start, second_end = slots[1] if len(slots) > 1 else (None, None)
+
+                            if punch.time() <= first_end:
+                                hr_attendance.create({'employee_id': emp_id,
+                                                    'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                record_created = True
+                            elif second_start and first_end < punch.time() <= second_end:
+                                prev_att = hr_attendance.search([('employee_id', '=', emp_id),
+                                                                ('check_out', '=', False),
+                                                                ('check_in', '!=', False),
+                                                                ('check_in', '>=', fields.Datetime.to_string(datetime.datetime.combine(punch.date(), datetime.time(0,0))))],
+                                                                order="check_in desc", limit=1)
+                                if prev_att:
+                                    prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                else:
+                                    hr_attendance.create({'employee_id': emp_id,
+                                                        'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    record_created = True
+                            elif second_end and punch.time() > second_end:
+                                prev_att = hr_attendance.search([('employee_id', '=', emp_id),
+                                                                ('check_out', '=', False)],
+                                                                order="check_in desc", limit=1)
+                                if prev_att:
+                                    prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                else:
+                                    hr_attendance.create({'employee_id': emp_id,
+                                                        'check_in': False,
+                                                        'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    record_created = True
+
+                        else:
+                            shift_start = slots[1][0]
+                            shift_end = slots[0][1]
+                            shift_check = slots[1][1]
+
+                            punch_date = punch.date()
+                            shift_start_dt = datetime.datetime.combine(punch, shift_start)
+                            shift_check_dt = datetime.datetime.combine(punch, shift_check)
+                            prev_day = punch.date() - datetime.timedelta(days=1)
+
+                            shift_start_dt = device_tz.localize(shift_start_dt)
+                            shift_check_dt = device_tz.localize(shift_check_dt)
+
+                            if (shift_start_dt - datetime.timedelta(hours=2)) <= punch < shift_check_dt:
+                                hr_attendance.create({
+                                    'employee_id': emp_id,
+                                    'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
+                                })
+                                record_created = True
+                            else:
+                                prev_att = hr_attendance.search([
+                                    ('employee_id', '=', emp_id),
+                                    ('check_out', '=', False),
+                                    ('check_in', '>=', fields.Datetime.to_string(
+                                        datetime.datetime.combine(prev_day, datetime.time.min).astimezone(pytz.utc)
+                                    )),
+                                    ('check_in', '<', fields.Datetime.to_string(
+                                        datetime.datetime.combine(punch_date, datetime.time.min).astimezone(pytz.utc)
+                                    )),
+                                ], order="check_in desc", limit=1)
+
+                                if prev_att:
+                                    prev_att.write({
+                                        'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                    })
+                                else:
+                                    hr_attendance.create({
+                                        'employee_id': emp_id,
+                                        'check_in': False,
+                                        'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
+                                    })
+                                    record_created = True
+
+            finally:
+                try:
+                    conn.enable_device()
+                except Exception:
+                    pass
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+        total_time = time.time() - start_time
+        _logger.info(f"Cron attendance download completed in {total_time:.2f} seconds.")
