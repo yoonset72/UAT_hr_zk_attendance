@@ -301,7 +301,7 @@ class BiometricDeviceDetails(models.Model):
         hr_attendance = self.env['hr.attendance']
 
         today = fields.Date.today()
-        start_date = datetime.date(2025, 9, 1)
+        start_date = datetime.date(2025, 8, 29)
         end_date = today
         device_tz = pytz.timezone('Asia/Rangoon')
 
