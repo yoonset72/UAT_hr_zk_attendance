@@ -46,16 +46,6 @@ class BiometricDeviceDetails(models.Model):
             _logger.error("Connection failed: %s", e)
             return False
 
-    def _is_duplicate_attendance(self, emp_id, punch, is_check_in=True):
-        """Check if hr.attendance for this punch already exists."""
-        hr_attendance = self.env['hr.attendance']
-        punch_str = fields.Datetime.to_string(punch.astimezone(pytz.utc))
-        domain = [('employee_id', '=', emp_id)]
-        if is_check_in:
-            domain.append(('check_in', '=', punch_str))
-        else:
-            domain.append(('check_out', '=', punch_str))
-        return hr_attendance.search_count(domain) > 0
 
     # ---------------- Actions ---------------- #
 
@@ -119,23 +109,176 @@ class BiometricDeviceDetails(models.Model):
         for cal in calendars:
             lines |= cal.attendance_ids.filtered(lambda a: int(a.dayofweek) == weekday)
         return lines.sorted('hour_from')
-
-    def _select_shift_type(self, employee, punch_datetime):
-        """Return shift type (day/night) and ordered slots for the punch date."""
-        punch_date = punch_datetime.date()
-        working_hours = self._get_employee_working_hours(employee, punch_date)
-        if not working_hours:
-            # default night shift if no calendar
-            return 'night', [(datetime.time(16, 45), datetime.time(8, 45))]
-        slots = [(self._float_hour_to_time(s.hour_from), self._float_hour_to_time(s.hour_to)) for s in working_hours]
-        if slots[0][0] == datetime.time(0, 0):
-            return 'night', slots
-        else:
-            return 'day', slots
-        
-    #--------------------Cron Download------------------------------------#
     
-    @api.model
+    # ------------------------------------------------------------------------
+
+    def _handle_same_day_hour_duplicate(self, hr_attendance, emp_id, punch, is_check_in=True):
+        """Handle duplicates within a 10-minute window for check_in or check_out."""
+        punch_utc = punch.astimezone(pytz.utc)
+        punch_str = fields.Datetime.to_string(punch_utc)
+        punch_day = punch_utc.date()
+
+        # Fetch all records for the employee on the same day
+        records = hr_attendance.search([
+            ('employee_id', '=', emp_id),
+            ('check_in' if is_check_in else 'check_out', '>=',
+            fields.Datetime.to_string(datetime.datetime.combine(punch_day, datetime.time.min))),
+            ('check_in' if is_check_in else 'check_out', '<=',
+            fields.Datetime.to_string(datetime.datetime.combine(punch_day, datetime.time.max)))
+        ])
+
+        closest_record = None
+        min_diff = 10 * 60  # 10 minutes in seconds
+
+        for rec in records:
+            existing_dt = rec.check_in if is_check_in else rec.check_out
+            if not existing_dt:
+                continue
+            existing_dt = fields.Datetime.from_string(existing_dt)
+            if existing_dt.tzinfo is None:
+                existing_dt = pytz.utc.localize(existing_dt)
+
+            time_diff = abs((punch_utc - existing_dt).total_seconds())
+            if time_diff <= 10 * 60 and time_diff < min_diff:
+                min_diff = time_diff
+                closest_record = rec
+
+        if closest_record:
+            existing_dt = fields.Datetime.from_string(
+                closest_record.check_in if is_check_in else closest_record.check_out
+            )
+            if existing_dt.tzinfo is None:
+                existing_dt = pytz.utc.localize(existing_dt)
+
+            if is_check_in:
+                if punch_utc < existing_dt:
+                    closest_record.write({'check_in': punch_str})
+                    return 'updated'
+                else:
+                    return 'discard'
+            else:
+                if punch_utc > existing_dt:
+                    closest_record.write({'check_out': punch_str})
+                    return 'updated'
+                else:
+                    return 'discard'
+
+        return 'new'
+
+    # --------------------------------------------------------------------------
+
+    def _select_shift_type(self, employee, punch_datetime, is_check_in=None):
+        """
+        Determine shift type (day/night) based on punch time and attendance logic.
+        Duplicate handling is done first to avoid misclassification.
+        If is_check_in is None, it will be inferred based on attendance state.
+        """
+
+        hr_attendance = self.env['hr.attendance']
+
+        # ---- Step 1: Check duplicates for both in and out ----
+        duplicate_checkin = self._handle_same_day_hour_duplicate(
+            hr_attendance=hr_attendance,
+            emp_id=employee.id,
+            punch=punch_datetime,
+            is_check_in=True
+        )
+        duplicate_checkout = self._handle_same_day_hour_duplicate(
+            hr_attendance=hr_attendance,
+            emp_id=employee.id,
+            punch=punch_datetime,
+            is_check_in=False
+        )
+
+        if duplicate_checkin in ('discard', 'updated') or duplicate_checkout in ('discard', 'updated'):
+            _logger.debug(
+                "[DUPLICATE] Emp: %s Punch: %s handled as duplicate (%s/%s). Skipping shift detection.",
+                employee.id, punch_datetime, duplicate_checkin, duplicate_checkout
+            )
+            return None, None
+
+        # ---- Step 2: Infer check-in/check-out if not provided ----
+        if is_check_in is None:
+            punch_date = punch_datetime.date()
+            open_attendance = hr_attendance.search([
+                ('employee_id', '=', employee.id),
+                ('check_out', '=', False),
+                ('check_in', '<=', fields.Datetime.to_string(datetime.datetime.combine(punch_date, datetime.time.max)))
+            ], limit=1)
+            is_check_in = False if open_attendance else True
+
+        # ---- Step 3: Get working hours and slots ----
+        punch_date = punch_datetime.date()
+        punch_time = punch_datetime.time()
+        working_hours = self._get_employee_working_hours(employee, punch_date)
+
+        slots = (
+            [(datetime.time(8, 45), datetime.time(16, 45))]
+            if not working_hours
+            else [
+                (self._float_hour_to_time(s.hour_from), self._float_hour_to_time(s.hour_to))
+                for s in working_hours
+            ]
+        )
+
+        # ---- Step 4: Shift determination ----
+        if len(employee.resource_calendar_ids) == 1:
+            # Single-shift employee
+            shift_type = 'night' if slots[0][0] == datetime.time(0, 0) else 'day'
+            _logger.debug(
+                "[SHIFT] Emp: %s Punch: %s Single shift_type: %s",
+                employee.id, punch_datetime, shift_type
+            )
+            return shift_type, slots
+        else:
+            # Multi-shift employee
+            day_shift_slots = []
+            for i, (start, end) in enumerate(slots):
+                if end.hour == 12 and i + 1 < len(slots):
+                    next_start, next_end = slots[i + 1]
+                    if next_start.hour == 13:
+                        day_shift_slots = [(start, end), (next_start, next_end)]
+                        break
+
+            relevant_slots = day_shift_slots if day_shift_slots else slots
+
+            attendances_today = hr_attendance.search([
+                ('employee_id', '=', employee.id),
+                ('check_in', '>=', datetime.datetime.combine(punch_date, datetime.time.min)),
+                ('check_in', '<=', datetime.datetime.combine(punch_date, datetime.time.max)),
+                ('check_out', '=', False)
+            ], order='check_in')
+
+            prev_date = punch_date - datetime.timedelta(days=1)
+            attendances_prev = hr_attendance.search([
+                ('employee_id', '=', employee.id),
+                ('check_in', '>=', datetime.datetime.combine(prev_date, datetime.time.min)),
+                ('check_in', '<=', datetime.datetime.combine(prev_date, datetime.time.max)),
+                ('check_out', '=', False)
+            ], order='check_in')
+
+            # Decide shift type
+            first_slot_start, first_slot_end = relevant_slots[0]
+            shift_type = 'day'
+            if punch_time < first_slot_start:
+                shift_type = 'night' if attendances_prev else 'day'
+            elif first_slot_start <= punch_time < first_slot_end:
+                shift_type = 'night' if attendances_prev else 'day'
+            elif len(relevant_slots) > 1 and relevant_slots[1][0] <= punch_time < relevant_slots[1][1]:
+                shift_type = 'day' if attendances_today else 'night'
+            else:
+                shift_type = 'day' if attendances_today else 'night'
+
+            _logger.debug(
+                "[SHIFT] Emp: %s Punch: %s Determined shift_type: %s (check_in=%s)",
+                employee.id, punch_datetime, shift_type, is_check_in
+            )
+            return shift_type, relevant_slots
+
+
+            #--------------------Cron Download------------------------------------#
+            
+    api.model
     def cron_download(self):
         """Cron job to download attendance from all configured devices"""
         devices = self.search([])
@@ -158,7 +301,7 @@ class BiometricDeviceDetails(models.Model):
         hr_attendance = self.env['hr.attendance']
 
         today = fields.Date.today()
-        start_date = datetime.date(2025, 8, 1)
+        start_date = datetime.date(2025, 9, 1)
         end_date = today
         device_tz = pytz.timezone('Asia/Rangoon')
 
@@ -173,6 +316,7 @@ class BiometricDeviceDetails(models.Model):
                 all_attendance = conn.get_attendance()
                 grouped_punches = {}
 
+                # Group attendance by employee
                 for att in all_attendance:
                     raw_ts = att.timestamp
                     local_dt = device_tz.localize(raw_ts) if raw_ts.tzinfo is None else raw_ts.astimezone(device_tz)
@@ -185,14 +329,16 @@ class BiometricDeviceDetails(models.Model):
                     utc_dt = local_dt.astimezone(pytz.utc)
                     punching_time = fields.Datetime.to_string(utc_dt)
                     if not zk_attendance.search([('device_id_num', '=', att.user_id), ('punching_time', '=', punching_time)], limit=1):
-                        zk_attendance.create({'employee_id': employee.id, 'device_id_num': att.user_id,
-                                              'attendance_type': str(getattr(att, 'status', '1')),
-                                              'punch_type': str(getattr(att, 'punch', '0')),
-                                              'punching_time': punching_time,
-                                              'address_id': info.address_id.id})
+                        zk_attendance.create({
+                            'employee_id': employee.id,
+                            'device_id_num': att.user_id,
+                            'attendance_type': str(getattr(att, 'status', '1')),
+                            'punch_type': str(getattr(att, 'punch', '0')),
+                            'punching_time': punching_time,
+                            'address_id': info.address_id.id
+                        })
                     grouped_punches.setdefault(employee.id, []).append(local_dt)
 
-                # Process punches
                 for emp_id, punches in grouped_punches.items():
                     punches = sorted(punches)
                     employee = self.env['hr.employee'].browse(emp_id)
@@ -200,46 +346,71 @@ class BiometricDeviceDetails(models.Model):
                         if punch.tzinfo is None:
                             punch = device_tz.localize(punch)
                         shift_type, slots = self._select_shift_type(employee, punch)
+                    
+                        if shift_type is None or slots is None:
+                            continue  # skip processing this punch
 
                         if shift_type == 'day':
                             first_start, first_end = slots[0]
                             second_start, second_end = slots[1] if len(slots) > 1 else (None, None)
 
                             if punch.time() <= first_end:
-                                if not self._is_duplicate_attendance(emp_id, punch, is_check_in=True):
-                                    hr_attendance.create({'employee_id': emp_id,
-                                                         'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                # Check-in logic
+                                result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=True)
+                                if result == 'new':
+                                    hr_attendance.create({
+                                        'employee_id': emp_id,
+                                        'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                    })
+                                # If result == 'discard', do nothing (already handled)
                             elif second_start and first_end < punch.time() <= second_end:
-                                prev_att = hr_attendance.search([('employee_id', '=', emp_id),
-                                                                 ('check_out', '=', False),
-                                                                 ('check_in', '!=', False),
-                                                                 ('check_in', '>=', fields.Datetime.to_string(datetime.datetime.combine(punch.date(), datetime.time(0,0))))],
-                                                                order="check_in desc", limit=1)
+                                # Check-out logic
+                                prev_att = hr_attendance.search([
+                                    ('employee_id', '=', emp_id),
+                                    ('check_out', '=', False),
+                                    ('check_in', '!=', False),
+                                    ('check_in', '>=', fields.Datetime.to_string(datetime.datetime.combine(punch.date(), datetime.time(0,0))))
+                                ], order="check_in desc", limit=1)
+
                                 if prev_att:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=False):
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                    # Only create a new check-out if result == 'new'
+                                    if result == 'new':
                                         prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    # If result == 'updated', do not create a new record, the check-out has been updated already!
                                 else:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=True):
-                                        hr_attendance.create({'employee_id': emp_id,
-                                                             'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=True)
+                                    if result == 'new':
+                                        hr_attendance.create({
+                                            'employee_id': emp_id,
+                                            'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                        })
+
                             elif second_end and punch.time() > second_end:
-                                prev_att = hr_attendance.search([('employee_id', '=', emp_id),
-                                                                 ('check_out', '=', False)],
-                                                                order="check_in desc", limit=1)
+                                prev_att = hr_attendance.search(
+                                    [('employee_id', '=', emp_id), ('check_out', '=', False)],
+                                    order="check_in desc", limit=1
+                                )
                                 if prev_att:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=False):
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                    if result == 'new':
                                         prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    # If result == 'updated', do not create a new record, the check-out has been updated already!
                                 else:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=False):
-                                        hr_attendance.create({'employee_id': emp_id,
-                                                             'check_in': False,
-                                                             'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                    if result == 'new':
+                                        hr_attendance.create({
+                                            'employee_id': emp_id,
+                                            'check_in': False,
+                                            'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                        })
 
                         else:  # Night shift
+                            # ... (Apply same pattern for night shift as above!)
                             shift_start = slots[1][0]
                             shift_end = slots[0][1]
                             shift_check = slots[1][1]
-                            
+
                             punch_date = punch.date()
                             shift_start_dt = datetime.datetime.combine(punch, shift_start)
                             shift_check_dt = datetime.datetime.combine(punch, shift_check)
@@ -249,11 +420,13 @@ class BiometricDeviceDetails(models.Model):
                             shift_check_dt = device_tz.localize(shift_check_dt)
 
                             if (shift_start_dt - datetime.timedelta(hours=2)) <= punch < shift_check_dt:
-                                if not self._is_duplicate_attendance(emp_id, punch, is_check_in=True):
+                                result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=True)
+                                if result == 'new':
                                     hr_attendance.create({
                                         'employee_id': emp_id,
                                         'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
                                     })
+                                # If result == 'discard', do nothing
                             else:
                                 prev_att = hr_attendance.search([
                                     ('employee_id', '=', emp_id),
@@ -267,16 +440,17 @@ class BiometricDeviceDetails(models.Model):
                                 ], order="check_in desc", limit=1)
 
                                 if prev_att:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=False):
-                                        prev_att.write({
-                                            'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))
-                                        })
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                    if result == 'new':
+                                        prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+                                    # If result == 'updated', do not create a new record, the check-out has been updated already!
                                 else:
-                                    if not self._is_duplicate_attendance(emp_id, punch, is_check_in=False):
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                    if result == 'new':
                                         hr_attendance.create({
                                             'employee_id': emp_id,
                                             'check_in': False,
-                                            'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc)),
+                                            'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))
                                         })
 
             finally:
@@ -291,11 +465,18 @@ class BiometricDeviceDetails(models.Model):
 
         total_time = time.time() - start_time
         _logger.info(f"Attendance download completed in {total_time:.2f} seconds.")
-        return {'type': 'ir.actions.act_window', 'name': 'Attendance Overview',
-                'res_model': 'zk.machine.attendance', 'view_mode': 'tree,form',
-                'domain': [('punching_time', '>=', fields.Date.to_string(start_date)),
-                           ('punching_time', '<=', fields.Date.to_string(end_date))],
-                'context': {'search_default_group_by_employee_id': 1}}
+        return {
+            'type': 'ir.actions.act_window',
+            'name': 'Attendance Overview',
+            'res_model': 'zk.machine.attendance',
+            'view_mode': 'tree,form',
+            'domain': [
+                ('punching_time', '>=', fields.Date.to_string(start_date)),
+                ('punching_time', '<=', fields.Date.to_string(end_date))
+            ],
+            'context': {'search_default_group_by_employee_id': 1}
+        }
+
 
     # ---------------- Device Restart ---------------- #
 
