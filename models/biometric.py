@@ -113,57 +113,78 @@ class BiometricDeviceDetails(models.Model):
     # ------------------------------------------------------------------------
 
     def _handle_same_day_hour_duplicate(self, hr_attendance, emp_id, punch, is_check_in=True):
-        """Handle duplicates within a 10-minute window for check_in or check_out."""
+        """
+        Handle duplicates within a 60-minute window for check_in or check_out.
+        - For check-in: take earliest punch.
+        - For check-out: take latest punch.
+        """
         punch_utc = punch.astimezone(pytz.utc)
         punch_str = fields.Datetime.to_string(punch_utc)
-        punch_day = punch_utc.date()
 
-        # Fetch all records for the employee on the same day
-        records = hr_attendance.search([
-            ('employee_id', '=', emp_id),
-            ('check_in' if is_check_in else 'check_out', '>=',
-            fields.Datetime.to_string(datetime.datetime.combine(punch_day, datetime.time.min))),
-            ('check_in' if is_check_in else 'check_out', '<=',
-            fields.Datetime.to_string(datetime.datetime.combine(punch_day, datetime.time.max)))
-        ])
+        # Define a 60-minute window
+        window_start = punch_utc - datetime.timedelta(minutes=60)
+        window_end = punch_utc + datetime.timedelta(minutes=60)
 
-        closest_record = None
-        min_diff = 10 * 60  # 10 minutes in seconds
+        if is_check_in:
+            # Search for earliest check-in in the window
+            records = hr_attendance.search([
+                ('employee_id', '=', emp_id),
+                ('check_in', '>=', fields.Datetime.to_string(window_start)),
+                ('check_in', '<=', fields.Datetime.to_string(window_end))
+            ])
+            closest_record = None
+            earliest_dt = None
 
-        for rec in records:
-            existing_dt = rec.check_in if is_check_in else rec.check_out
-            if not existing_dt:
-                continue
-            existing_dt = fields.Datetime.from_string(existing_dt)
-            if existing_dt.tzinfo is None:
-                existing_dt = pytz.utc.localize(existing_dt)
+            for rec in records:
+                if not rec.check_in:
+                    continue
+                existing_dt = fields.Datetime.from_string(rec.check_in)
+                if existing_dt.tzinfo is None:
+                    existing_dt = pytz.utc.localize(existing_dt)
 
-            time_diff = abs((punch_utc - existing_dt).total_seconds())
-            if time_diff <= 10 * 60 and time_diff < min_diff:
-                min_diff = time_diff
-                closest_record = rec
+                if earliest_dt is None or existing_dt > punch_utc:
+                    earliest_dt = existing_dt
+                    closest_record = rec
 
-        if closest_record:
-            existing_dt = fields.Datetime.from_string(
-                closest_record.check_in if is_check_in else closest_record.check_out
-            )
-            if existing_dt.tzinfo is None:
-                existing_dt = pytz.utc.localize(existing_dt)
-
-            if is_check_in:
-                if punch_utc < existing_dt:
+            if closest_record:
+                if punch_utc < earliest_dt:
                     closest_record.write({'check_in': punch_str})
                     return 'updated'
                 else:
                     return 'discard'
             else:
-                if punch_utc > existing_dt:
+                return 'new'
+
+        else:  # check-out
+            # Search for latest check-out in the window
+            records = hr_attendance.search([
+                ('employee_id', '=', emp_id),
+                ('check_out', '>=', fields.Datetime.to_string(window_start)),
+                ('check_out', '<=', fields.Datetime.to_string(window_end))
+            ])
+            closest_record = None
+            latest_dt = None
+
+            for rec in records:
+                if not rec.check_out:
+                    continue
+                existing_dt = fields.Datetime.from_string(rec.check_out)
+                if existing_dt.tzinfo is None:
+                    existing_dt = pytz.utc.localize(existing_dt)
+
+                if latest_dt is None or existing_dt < punch_utc:
+                    latest_dt = existing_dt
+                    closest_record = rec
+
+            if closest_record:
+                if punch_utc > latest_dt:
                     closest_record.write({'check_out': punch_str})
                     return 'updated'
                 else:
                     return 'discard'
+            else:
+                return 'new'
 
-        return 'new'
 
     # --------------------------------------------------------------------------
 
