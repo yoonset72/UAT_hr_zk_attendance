@@ -376,14 +376,26 @@ class BiometricDeviceDetails(models.Model):
                             second_start, second_end = slots[1] if len(slots) > 1 else (None, None)
 
                             if punch.time() <= first_end:
-                                # Check-in logic
-                                result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=True)
-                                if result == 'new':
-                                    hr_attendance.create({
-                                        'employee_id': emp_id,
-                                        'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))
-                                    })
-                                # If result == 'discard', do nothing (already handled)
+                                prev_att = hr_attendance.search([
+                                    ('employee_id', '=', emp_id),
+                                    ('check_out', '=', False),
+                                ], order="check_in desc", limit=1)
+
+                                if not prev_att:
+                                    # No active attendance → Check-in
+                                    result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=True)
+                                    if result == 'new':
+                                        hr_attendance.create({
+                                            'employee_id': emp_id,
+                                            'check_in': fields.Datetime.to_string(punch.astimezone(pytz.utc))
+                                        })
+                                else:
+                                    # Active attendance found → treat as check-out
+                                    if prev_att.check_in.time() != punch.time() and prev_att.check_in.time() < first_end:
+                                        result = self._handle_same_day_hour_duplicate(hr_attendance, emp_id, punch, is_check_in=False)
+                                        if result == 'new':
+                                            prev_att.write({'check_out': fields.Datetime.to_string(punch.astimezone(pytz.utc))})
+
                             elif second_start and first_end < punch.time() <= second_end:
                                 # Check-out logic
                                 prev_att = hr_attendance.search([

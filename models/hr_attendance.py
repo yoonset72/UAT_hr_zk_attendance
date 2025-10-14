@@ -44,3 +44,4 @@ class HrAttendance(models.Model):
         related='employee_id.job_title',
         store=True
     )
+    remarks = fields.Char(string="Remarks")
