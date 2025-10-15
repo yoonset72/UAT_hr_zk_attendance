@@ -379,7 +379,14 @@ class BiometricDeviceDetails(models.Model):
                                 prev_att = hr_attendance.search([
                                     ('employee_id', '=', emp_id),
                                     ('check_out', '=', False),
+                                    ('check_in', '>=', fields.Datetime.to_string(
+                                        datetime.datetime.combine(punch.date(), datetime.time.min).astimezone(pytz.utc)
+                                    )),
+                                    ('check_in', '<', fields.Datetime.to_string(
+                                        datetime.datetime.combine(punch.date(), datetime.time.min).astimezone(pytz.utc)
+                                    )),
                                 ], order="check_in desc", limit=1)
+
 
                                 if not prev_att:
                                     # No active attendance → Check-in
