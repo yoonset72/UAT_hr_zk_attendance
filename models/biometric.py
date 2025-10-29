@@ -122,8 +122,8 @@ class BiometricDeviceDetails(models.Model):
         punch_str = fields.Datetime.to_string(punch_utc)
 
         # Define a 60-minute window
-        window_start = punch_utc - datetime.timedelta(minutes=60)
-        window_end = punch_utc + datetime.timedelta(minutes=60)
+        window_start = punch_utc - datetime.timedelta(minutes=120)
+        window_end = punch_utc + datetime.timedelta(minutes=120)
 
         if is_check_in:
             # Search for earliest check-in in the window
