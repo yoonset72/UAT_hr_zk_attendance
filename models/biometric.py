@@ -268,7 +268,7 @@ class BiometricDeviceDetails(models.Model):
                 ('check_in', '>=', datetime.datetime.combine(punch_date, datetime.time.min)),
                 ('check_in', '<=', datetime.datetime.combine(punch_date, datetime.time.max)),
                 ('check_out', '=', False)
-            ], order='che￼ck_in')
+            ], order='check_in')
 
             prev_date = punch_date - datetime.timedelta(days=1)
             attendances_prev = hr_attendance.search([
