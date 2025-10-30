@@ -159,8 +159,12 @@ class BiometricDeviceDetails(models.Model):
             # Search for latest check-out in the window
             records = hr_attendance.search([
                 ('employee_id', '=', emp_id),
-                ('check_out', '>=', fields.Datetime.to_string(window_start)),
-                ('check_out', '<=', fields.Datetime.to_string(window_end))
+                ('check_out', '>=', fields.Datetime.to_string(
+                    punch_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+                )),
+                ('check_out', '<=', fields.Datetime.to_string(
+                    punch_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
+                ))
             ])
             closest_record = None
             latest_dt = None
@@ -322,7 +326,7 @@ class BiometricDeviceDetails(models.Model):
         hr_attendance = self.env['hr.attendance']
 
         today = fields.Date.today()
-        start_date = datetime.date(2025, 8, 29)
+        start_date = datetime.date(2025, 10, 25)
         end_date = today
         device_tz = pytz.timezone('Asia/Rangoon')
 
